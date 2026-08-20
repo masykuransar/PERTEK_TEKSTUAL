@@ -12,6 +12,7 @@ dikirim ke internet.
 """
 
 import io
+import json
 import os
 import zipfile
 from datetime import datetime
@@ -20,6 +21,8 @@ import openpyxl
 import pandas as pd
 import streamlit as st
 from docxtpl import DocxTemplate
+from shapely.geometry import Point, shape as shapely_shape
+from shapely.ops import transform as shapely_transform
 
 st.set_page_config(
     page_title="Isi Dokumen Otomatis",
@@ -78,6 +81,83 @@ def buat_dokumen(template_bytes, daftar_pemohon, kolom_nama="nama_pemohon"):
         doc.save(buffer)
         hasil.append((f"{nama_file}.docx", buffer.getvalue()))
     return hasil
+
+
+def parse_koordinat(teks):
+    """Parse 'lat, lon' desimal jadi (lat, lon). Kembalikan None kalau gagal."""
+    try:
+        bagian = str(teks).replace(";", ",").split(",")
+        if len(bagian) != 2:
+            return None
+        lat = float(bagian[0].strip())
+        lon = float(bagian[1].strip())
+        return lat, lon
+    except Exception:
+        return None
+
+
+def muat_rtrw_geojson(file_bytes):
+    data = json.loads(file_bytes)
+    records = []
+    for feat in data.get("features", []):
+        geom = shapely_shape(feat["geometry"])
+        records.append({"geom": geom, "attrs": feat.get("properties", {}) or {}})
+    field_tersedia = sorted(records[0]["attrs"].keys()) if records else []
+    return records, field_tersedia
+
+
+def muat_rtrw_shapefile_zip(zip_bytes):
+    import shapefile  # pyshp
+
+    zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    peta_ekstensi = {os.path.splitext(n)[1].lower(): n for n in zf.namelist()}
+
+    for wajib in (".shp", ".dbf"):
+        if wajib not in peta_ekstensi:
+            raise ValueError(f"File {wajib} tidak ditemukan di dalam .zip. Pastikan .shp, .dbf, .shx, dan .prj ada semua.")
+
+    shp_bytes = zf.read(peta_ekstensi[".shp"])
+    dbf_bytes = zf.read(peta_ekstensi[".dbf"])
+    shx_bytes = zf.read(peta_ekstensi[".shx"]) if ".shx" in peta_ekstensi else None
+    prj_teks = zf.read(peta_ekstensi[".prj"]).decode("utf-8", errors="ignore") if ".prj" in peta_ekstensi else None
+
+    sf = shapefile.Reader(
+        shp=io.BytesIO(shp_bytes),
+        dbf=io.BytesIO(dbf_bytes),
+        shx=io.BytesIO(shx_bytes) if shx_bytes else None,
+    )
+    nama_field = [f[0] for f in sf.fields[1:]]  # field pertama selalu DeletionFlag, dilewati
+
+    records = []
+    for sr in sf.shapeRecords():
+        geom = shapely_shape(sr.shape.__geo_interface__)
+        attrs = dict(zip(nama_field, sr.record))
+        records.append({"geom": geom, "attrs": attrs})
+
+    # Reproject ke WGS84 (lat/lon) kalau shapefile memakai sistem koordinat lain (mis. UTM)
+    if prj_teks:
+        try:
+            from pyproj import CRS, Transformer
+
+            crs_asal = CRS.from_wkt(prj_teks)
+            crs_wgs84 = CRS.from_epsg(4326)
+            if crs_asal != crs_wgs84:
+                transformer = Transformer.from_crs(crs_asal, crs_wgs84, always_xy=True)
+                for rec in records:
+                    rec["geom"] = shapely_transform(transformer.transform, rec["geom"])
+        except Exception:
+            pass  # Kalau gagal reproject, tetap lanjut pakai koordinat asli
+
+    return records, sorted(nama_field)
+
+
+def cari_zona_rtrw(lat, lon, records, kolom_zona):
+    titik = Point(lon, lat)  # shapely: urutan (x=lon, y=lat)
+    for rec in records:
+        geom = rec["geom"]
+        if geom.contains(titik) or geom.intersects(titik):
+            return rec["attrs"].get(kolom_zona, "")
+    return None
 
 
 def buat_zip(daftar_file):
@@ -209,10 +289,72 @@ jumlah_valid = df_hasil_edit.dropna(how="all").shape[0]
 st.write(f"Total: **{jumlah_valid} pemohon** siap diproses.")
 
 # ---------------------------------------------------------------------- #
-# 4. Buat dokumen
+# 4. Cek kesesuaian RTRW (opsional)
 # ---------------------------------------------------------------------- #
 st.divider()
-st.subheader("4. Buat Dokumen")
+st.subheader("4. Cek Kesesuaian RTRW (Opsional)")
+st.caption(
+    "Upload data pola ruang RTRW untuk mengecek zona di titik koordinat setiap pemohon "
+    "(dari kolom 'koordinat_lokasi', format desimal: `1.234567, 124.567890`)."
+)
+
+rtrw_file = st.file_uploader(
+    "Upload pola ruang RTRW — GeoJSON (.geojson/.json) atau Shapefile (.zip berisi .shp + .dbf + .shx + .prj)",
+    type=["geojson", "json", "zip"],
+    key="rtrw_uploader",
+)
+
+if rtrw_file is not None:
+    try:
+        if rtrw_file.name.lower().endswith(".zip"):
+            rtrw_records, field_tersedia = muat_rtrw_shapefile_zip(rtrw_file.read())
+        else:
+            rtrw_records, field_tersedia = muat_rtrw_geojson(rtrw_file.read())
+
+        st.success(f"Berhasil memuat {len(rtrw_records)} poligon zona pola ruang.")
+
+        if not field_tersedia:
+            st.warning("Tidak ada kolom atribut yang terdeteksi di file ini.")
+        else:
+            kolom_zona = st.selectbox(
+                "Kolom mana yang berisi nama zona/pola ruang?",
+                field_tersedia,
+                help="Contoh nama kolom yang umum dipakai: NAMOBJ, POLA_RUANG, KETERANGAN",
+            )
+
+            if st.button("🔍 Cek Kesesuaian untuk Semua Pemohon", use_container_width=True):
+                df_cek = df_hasil_edit.dropna(how="all").copy()
+                hasil_zona = []
+                for _, baris in df_cek.iterrows():
+                    koordinat = baris.get("koordinat_lokasi", "")
+                    hasil_parse = parse_koordinat(koordinat)
+                    if not hasil_parse:
+                        hasil_zona.append("⚠️ Format koordinat tidak terbaca")
+                        continue
+                    lat, lon = hasil_parse
+                    zona = cari_zona_rtrw(lat, lon, rtrw_records, kolom_zona)
+                    hasil_zona.append(zona if zona not in (None, "") else "❌ Di luar seluruh zona / tidak ditemukan")
+                df_cek["zona_rtrw"] = hasil_zona
+                st.session_state["hasil_cek_rtrw"] = df_cek
+
+    except Exception as exc:
+        st.error(f"Gagal membaca file RTRW: {exc}")
+
+if "hasil_cek_rtrw" in st.session_state:
+    kolom_tampil = [k for k in [kolom_nama_file, "koordinat_lokasi", "zona_rtrw"] if k in st.session_state["hasil_cek_rtrw"].columns]
+    st.write("**Hasil pengecekan zona per pemohon:**")
+    st.dataframe(st.session_state["hasil_cek_rtrw"][kolom_tampil], use_container_width=True)
+    st.caption(
+        "⚠️ Hasil ini murni perhitungan geometris (titik vs poligon) dari data yang kamu upload. "
+        "Selalu verifikasi manual untuk keputusan resmi, terutama untuk titik yang dekat batas zona "
+        "atau kalau data RTRW yang diupload belum yang terbaru."
+    )
+
+# ---------------------------------------------------------------------- #
+# 5. Buat dokumen
+# ---------------------------------------------------------------------- #
+st.divider()
+st.subheader("5. Buat Dokumen")
 
 if st.button("🚀 Buat Semua Dokumen", type="primary", use_container_width=True):
     daftar_final = df_hasil_edit.dropna(how="all").fillna("").to_dict("records")
